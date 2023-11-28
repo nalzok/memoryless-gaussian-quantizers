@@ -49,8 +49,7 @@ def decode(encoded, transition, emission, alphabet):
     return decoded
     
 
-def evaluate(key, transition, emission, alphabet, n_samples):
-    samples = jax.random.normal(key, (n_samples,))
+def evaluate(samples, transition, emission, alphabet):
     encoded = encode(samples, transition, emission, alphabet)
     decoded = decode(encoded, transition, emission, alphabet)
     residual = samples - decoded
@@ -63,13 +62,14 @@ def evaluate(key, transition, emission, alphabet, n_samples):
     return mse, entropy
 
 
-def train(key, transition, emission, alphabets, n_samples, learning_rate, n_steps):
+def train(key, transition, emission, alphabets, block_size, learning_rate, n_steps):
 
     @jax.jit
     def train_step(key_step, ab, opt_state):
         ab = (ab - jnp.flipud(ab))/2    # enforce alphabet symmetry
         grad_fn = jax.value_and_grad(evaluate, argnums=3, has_aux=True)
-        (mse, entropy), grads = grad_fn(key_step, transition, emission, ab, n_samples)
+        samples = jax.random.normal(key_step, (block_size,))
+        (mse, entropy), grads = grad_fn(samples, transition, emission, ab)
         updates, opt_state = gradient_transform.update(grads, opt_state, ab)
         ab = optax.apply_updates(ab, updates)
 
@@ -96,12 +96,12 @@ def train(key, transition, emission, alphabets, n_samples, learning_rate, n_step
     return alphabets
 
 
-def main(n_samples, learning_rate, n_steps):
+def main(block_size, learning_rate, n_steps):
     # TODO: If we use an eight-state trellis, each alphabet only contains one element. In this case,
     #       can we make it *completely* parallelizable by storing the states instead of inputs?
 
     # Ungerboeck's trellis (Fig. 3.5.) + rate-3 Lloyd-Max quantizer
-    # MSE = 0.0880
+    # MSE = 0.0881
     # transition = jnp.array([
     #     [0, 1, 0, 1],
     #     [2, 3, 2, 3],
@@ -117,7 +117,7 @@ def main(n_samples, learning_rate, n_steps):
     # alphabet_init = jnp.array([-2.152, -1.344, -0.756, -0.245, 0.245, 0.756, 1.344, 2.152])
 
     # Quadrupled Output Alphabets (Chapter III.C & Table B.1) + rate-4 Lloyd-Max quantizer
-    # MSE = 0.0821
+    # MSE = 0.0824
     transition = jnp.array([
         [ 0,  2,  0,  2], [ 9, 11,  9, 11], [ 1,  3,  1,  3], [ 8, 10,  8, 10],
         [ 0,  2,  0,  2], [ 9, 11,  9, 11], [ 1,  3,  1,  3], [ 8, 10,  8, 10],
@@ -138,17 +138,23 @@ def main(n_samples, learning_rate, n_steps):
     key = jax.random.PRNGKey(42)
     key_train, key_test = jax.random.split(key)
 
-    alphabet = train(key_train, transition, emission, alphabet_init, n_samples, learning_rate, n_steps)
+    alphabet = train(key_train, transition, emission, alphabet_init, block_size, learning_rate, n_steps)
     print("Before", alphabet_init)
     print("After", alphabet)
 
-    mse, entropy = evaluate(key_test, transition, emission, alphabet, 2**21)
-    print(f"final: {mse.item() = :.4f}, {entropy.item() = :.4f}")
+    samples = jax.random.normal(key_test, (2**21//block_size, block_size))
+    batch_evaluate = jax.jit(jax.vmap(evaluate, (0, None, None, None)))
+    mse_all, entropy_all = batch_evaluate(samples, transition, emission, alphabet)
+    mse_mean = jnp.mean(mse_all).item()
+    mse_std = jnp.std(mse_all).item()
+    entropy_mean = jnp.mean(entropy_all).item()
+    entropy_std = jnp.std(entropy_all).item()
+    print(f"final: {mse_mean = :.4f} ({mse_std:.3f}), {entropy_mean = :.4f} ({entropy_std:.3f})")
 
 
 
 if __name__ == "__main__":
-    n_samples = 2**10
+    block_size = 2**10
     learning_rate = 1e-2
     n_steps = 2**10
-    main(n_samples, learning_rate, n_steps)
+    main(block_size, learning_rate, n_steps)
