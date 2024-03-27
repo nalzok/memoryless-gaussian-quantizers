@@ -1,32 +1,30 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 import optax
+from tqdm import trange
 
 
 def encode(samples, alphabet):
     M, = alphabet.shape
+    L = M.bit_length() - 1
+    assert len(samples.shape) == 1
 
     permutation = jax.random.permutation(jax.random.PRNGKey(42), M)
 
     def f(rho, sample):
-        def process_state(state, val):
-            next_rho, prev_state, prev_input = val
-            for input_ in range(1<<2):
-                next_state = (M-1) & ((state<<2) | input_)
-                output = alphabet[permutation[next_state]]
-                loss = rho[state] + (sample-output)**2
-                pred = loss < next_rho[next_state]
-                next_rho = next_rho.at[next_state].set(jax.lax.select(pred, loss, next_rho[next_state]))
-                prev_state = prev_state.at[next_state].set(jax.lax.select(pred, state, prev_state[next_state]))
-                prev_input = prev_input.at[next_state].set(jax.lax.select(pred, input_, prev_input[next_state]))
+        states = jnp.arange(M)
+        discarded = jnp.arange(1<<2)
+        last_state = (discarded << (L-2)) | (states[..., jnp.newaxis] >> 2)
+        output = alphabet[permutation[states[..., jnp.newaxis]]]
+        loss = rho[last_state] + (sample-output)**2
 
-            return next_rho, prev_state, prev_input
-
-        next_rho = jnp.full((M,), jnp.inf)
-        prev_state = jnp.empty((M,), dtype=int)
-        prev_input = jnp.empty((M,), dtype=int)
-        next_rho, prev_state, prev_input = jax.lax.fori_loop(0, M, process_state, (next_rho, prev_state, prev_input))
+        next_rho = jnp.min(loss, axis=-1)
+        optimal_discarded = jnp.argmin(loss, axis=-1)
+        prev_state = (optimal_discarded << (L-2)) | (states >> 2)
+        prev_input = states & 0b11
 
         return next_rho, (prev_state, prev_input)
 
@@ -99,16 +97,16 @@ def train(key, alphabets, block_size, learning_rate, n_steps):
     )
     opt_state = gradient_transform.init(alphabets)
 
-    for step in range(n_steps):
+    for step in (pbar := trange(n_steps)):
         key_step = jax.random.fold_in(key, step)
         mse, entropy, alphabets, opt_state = train_step(key_step, alphabets, opt_state)
-        print(f"step #{step+1}, {mse.item() = :.4f}, {entropy.item() = :.4f}")
+        pbar.set_description(f"{mse.item() = :.4f}, {entropy.item() = :.4f}")
 
     return alphabets
 
 
 def main(block_size, learning_rate, n_steps):
-    L = 10
+    L = 21
     M = 1<<L
     alphabet = jsp.stats.norm.ppf((2*jnp.arange(M)+1)/2/M)
     print("Before", alphabet)
@@ -120,8 +118,7 @@ def main(block_size, learning_rate, n_steps):
     # print("After", alphabet)
 
     samples = jax.random.normal(key_test, (2**18//block_size, block_size))
-    batch_evaluate = jax.jit(jax.vmap(evaluate, (0, None)))
-    mse_all, entropy_all = batch_evaluate(samples, alphabet)
+    mse_all, entropy_all = jax.lax.map(partial(evaluate, alphabet=alphabet), samples)
     mse_mean = jnp.mean(mse_all).item()
     mse_std = jnp.std(mse_all).item()
     entropy_mean = jnp.mean(entropy_all).item()
